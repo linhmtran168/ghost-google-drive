@@ -9,9 +9,8 @@
 const StorageBase = require("ghost-storage-base");
 const fs = require("fs");
 const { google } = require("googleapis");
-const https = require("https");
 
-const API_VERSION = "v2";
+const API_VERSION = "v3";
 const API_SCOPES = ["https://www.googleapis.com/auth/drive"];
 
 class ghostGoogleDrive extends StorageBase {
@@ -31,7 +30,7 @@ class ghostGoogleDrive extends StorageBase {
    */
   save(file, targetDir) {
     const _this = this;
-    return new Promise(function(resolve, reject) {
+    return new Promise(async function(resolve, reject) {
       const key = _this.config.key;
       const jwtClient = new google.auth.JWT(
         key.client_email,
@@ -41,57 +40,41 @@ class ghostGoogleDrive extends StorageBase {
         null
       );
 
-      jwtClient.authorize(function(err, tokens) {
-        if (err) {
-          console.log(err);
-          reject(err);
-          return;
-        }
+      try {
+        await jwtClient.authorize();
 
         const drive = google.drive({
           version: API_VERSION,
           auth: jwtClient
         });
-        drive.files.insert(
-          {
-            resource: {
-              title: file.name,
-              mimeType: file.type
-            },
-            media: {
-              mimeType: file.type,
-              body: fs.createReadStream(file.path)
-            }
-          },
-          function(err, res) {
-            if (err) {
-              console.log(err);
-              reject(err);
-              return;
-            }
-            const { data } = res;
-            // make the url looks like a file
-            resolve("/content/images/" + data.id + "." + data.fileExtension);
 
-            drive.permissions.insert({
-              fileId: data.id,
-              supportsAllDrives: true,
-              supportsTeamDrives: true,
-              resource: {
-                  'type': 'anyone',
-                  'role': 'reader',
-              },
-              fields: 'id',
-            }, function(err, res) {
-              if (err) {
-                console.error(err);
-              } else {
-                console.log('Permission ID: ', res.id)
-              }
-            });
+        const fileUploadRes = await drive.files.create({
+          resource: {
+            name: file.name,
+          },
+          media: {
+            mimeType: file.type,
+            body: fs.createReadStream(file.path)
           }
-        );
-      });
+        });
+
+        const { data } = fileUploadRes;
+        await drive.permissions.create({
+          fileId: data.id,
+          supportsAllDrives: true,
+          supportsTeamDrives: true,
+          resource: {
+              'type': 'anyone',
+              'role': 'reader',
+          }
+        });
+              
+        // make the url looks like a file
+        resolve("/content/images/" + data.id + file.ext);
+      } catch (err) {
+        console.error(err);
+        reject(err);
+      }
     });
   }
 
@@ -108,7 +91,7 @@ class ghostGoogleDrive extends StorageBase {
    */
   serve() {
     const _this = this;
-    return function serveStaticContent(req, res, next) {
+    return async function(req, res, next) {
       // get the file id from url
       const id = req.path.replace("/", "").split(".")[0];
 
@@ -120,51 +103,36 @@ class ghostGoogleDrive extends StorageBase {
         API_SCOPES,
         null
       );
-      //auth
-      jwtClient.authorize(function(err, tokens) {
-        if (err) {
-          return next(err);
-        }
+
+      try {
+        await jwtClient.authorize()
+
         const drive = google.drive({
           version: API_VERSION,
           auth: jwtClient
         });
-        drive.files.get(
-          {
-            fileId: id
-          },
-          function(err, response) {
-            if (!err) {
-              const file = response.data;
-              const newReq = https
-                .request(
-                  file.webContentLink,
-                  function(newRes) {
-                    // Modify google headers here to cache!
-                    const headers = newRes.headers;
-                    headers["content-disposition"] =
-                      "attachment; filename=" + file.originalFilename;
-                    headers["cache-control"] = "public, max-age=1209600";
-                    delete headers["expires"];
 
-                    res.writeHead(newRes.statusCode, headers);
-                    // pipe the file
-                    newRes.pipe(res);
-                  }
-                )
-                .on("error", function(err) {
-                  console.log(err);
-                  res.statusCode = 500;
-                  res.end();
-                });
-              req.pipe(newReq);
-            } else {
-              next(err);
-            }
-          }
-        );
-      });
-      //return next(new errors.GhostError({err: err}));
+        const fileGetRes = await drive.files.get({
+          fileId: id,
+          alt: 'media'
+        }, {
+          responseType: 'stream'
+        });
+
+        res.set("Cache-Control", "public, max-age=1209600");
+        fileGetRes.data
+          .on('end', () => {
+            console.log('Done downloading file.');
+          })
+          .on('error', err => {
+            console.error(err);
+            next(err);
+          })
+          .pipe(res);
+      } catch (err) {
+        console.error(err);
+        next(err);
+      }
     };
   }
 
@@ -172,9 +140,10 @@ class ghostGoogleDrive extends StorageBase {
    * Not implemented.
    * @returns {Promise.<*>}
    */
-  delete() {
+  delete(options) {
     const _this = this;
-    return new Promise(function(resolve, reject) {
+    const id = options.path.replace("/", "").split(".")[0];
+    return new Promise(async function(resolve, reject) {
       const key = _this.config.key;
       const jwtClient = new google.auth.JWT(
         key.client_email,
@@ -184,27 +153,23 @@ class ghostGoogleDrive extends StorageBase {
         null
       );
 
-      jwtClient.authorize(function(err, tokens) {
-        if (err) {
-          return reject(err);
-        }
+      try {
+        await jwtClient.authorize();
+
         const drive = google.drive({
           version: API_VERSION,
           auth: jwtClient
         });
-        drive.files.delete(
-          {
-            fileId: id
-          },
-          function(err, data) {
-            if (err) {
-              console.log(err);
-              return reject(err);
-            }
-            resolve();
-          }
-        );
-      });
+
+        await drive.files.delete({
+          fileId: id
+        });
+
+        resolve();
+      } catch (err) {
+        console.error(err);
+        reject(err);
+      }
     });
   }
 
@@ -217,7 +182,7 @@ class ghostGoogleDrive extends StorageBase {
   read(options) {
     const _this = this;
     const id = options.path.replace("/", "").split(".")[0];
-    return new Promise((resolve, reject) => {
+    return new Promise(async function(resolve, reject) {
       const key = _this.config.key;
       const jwtClient = new google.auth.JWT(
         key.client_email,
@@ -226,44 +191,39 @@ class ghostGoogleDrive extends StorageBase {
         API_SCOPES,
         null
       );
-      //auth
-      jwtClient.authorize((err, tokens) => {
-        if (err) {
-          return reject(err);
-        }
+
+      try {
+        await jwtClient.authorize();
+
         const drive = google.drive({
           version: API_VERSION,
           auth: jwtClient
         });
-        drive.files.get(
-          {
-            fileId: id
-          },
-          (err, response) => {
-            if (!err) {
-              const file = response.data;
-              const req = https
-                .request(
-                  file.webContentLink,
-                  res => {
-                    let bytes = [];
-                    res.on("data", chunk => {
-                      bytes.push(chunk);
-                    });
-                    res.on("end", () => {
-                      const binary = Buffer.concat(bytes);
-                      resolve(binary);
-                    });
-                  }
-                )
-                .end();
-              req.on("error", reject);
-            } else {
-              reject(err);
-            }
-          }
-        );
-      });
+
+        const fileGetRes = await drive.files.get({
+          fileId: id,
+          alt: 'media'
+        }, {
+          responseType: 'stream'
+        });
+
+        let bytes = [];
+        fileGetRes.data
+          .on("data", chunk => {
+              bytes.push(chunk);
+            })
+          .on("error", err => {
+            console.error(err);
+            reject(err);
+          })
+          .on("end", () => {
+            const binary = Buffer.concat(bytes);
+            resolve(binary);
+          });
+      } catch(err) {
+        console.error(err);
+        reject(err);
+      }
     });
   }
 }
